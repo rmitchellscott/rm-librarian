@@ -1,0 +1,91 @@
+version 0.1.0
+
+export lookupEntry
+with
+    xovi-message-broker$simpleSignal = "lookupEntry"
+    xovi-message-broker$version = 1
+end
+
+export importDocument
+with
+    xovi-message-broker$simpleSignal = "importDocument"
+    xovi-message-broker$version = 1
+end
+
+export renameEntry
+with
+    xovi-message-broker$simpleSignal = "renameEntry"
+    xovi-message-broker$version = 1
+end
+
+export moveEntry
+with
+    xovi-message-broker$simpleSignal = "moveEntry"
+    xovi-message-broker$version = 1
+end
+
+export trashEntry
+with
+    xovi-message-broker$simpleSignal = "trashEntry"
+    xovi-message-broker$version = 1
+end
+
+export restoreEntry
+with
+    xovi-message-broker$simpleSignal = "restoreEntry"
+    xovi-message-broker$version = 1
+end
+
+export deleteEntry
+with
+    xovi-message-broker$simpleSignal = "deleteEntry"
+    xovi-message-broker$version = 1
+end
+
+export cloneEntry
+with
+    xovi-message-broker$simpleSignal = "cloneEntry"
+    xovi-message-broker$version = 1
+end
+
+export createNotebook
+with
+    xovi-message-broker$simpleSignal = "createNotebook"
+    xovi-message-broker$version = 1
+end
+
+export createFolder
+with
+    xovi-message-broker$simpleSignal = "createFolder"
+    xovi-message-broker$version = 1
+end
+
+export setPinned
+with
+    xovi-message-broker$simpleSignal = "setPinned"
+    xovi-message-broker$version = 1
+end
+
+export setCover
+with
+    xovi-message-broker$simpleSignal = "setCover"
+    xovi-message-broker$version = 1
+end
+
+export setOrientation
+with
+    xovi-message-broker$simpleSignal = "setOrientation"
+    xovi-message-broker$version = 1
+end
+
+export ensureFolder
+with
+    xovi-message-broker$simpleSignal = "ensureFolder"
+    xovi-message-broker$version = 1
+end
+
+export setTags
+with
+    xovi-message-broker$simpleSignal = "setTags"
+    xovi-message-broker$version = 1
+end

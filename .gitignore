@@ -1,0 +1,15 @@
+# Build artifacts
+*.so
+*.o
+xovi.cpp
+xovi.h
+Makefile
+
+# Qt build files
+.qmake.stash
+moc_*.cpp
+moc_*.h
+*.pro.user
+
+# macOS
+.DS_Store
