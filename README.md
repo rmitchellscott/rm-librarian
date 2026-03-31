@@ -51,6 +51,15 @@ echo '>eimportDocument:/path/to/file.pdf' > /run/xovi-mb; cat /run/xovi-mb-out
 echo '>eimportDocument:/path/to/file.pdf,My Folder' > /run/xovi-mb; cat /run/xovi-mb-out
 ```
 
+### Import Image
+
+Import a PNG or JPEG image, converting it to a single-page PDF for display in xochitl. Returns the new document's UUID.
+
+```bash
+echo '>eimportImage:/path/to/screenshot.png' > /run/xovi-mb; cat /run/xovi-mb-out
+echo '>eimportImage:/path/to/photo.jpg,My Folder' > /run/xovi-mb; cat /run/xovi-mb-out
+```
+
 ### Rename
 
 ```bash
@@ -141,6 +150,7 @@ XoviMessageBroker { id: librarian }
 ```qml
 librarian.sendSimpleSignal("lookupEntry", "My Document")
 librarian.sendSimpleSignal("importDocument", "/tmp/report.pdf,My Folder")
+librarian.sendSimpleSignal("importImage", "/tmp/screenshot.png,Screenshots")
 librarian.sendSimpleSignal("renameEntry", "My Document,New Name")
 librarian.sendSimpleSignal("moveEntry", "My Document,Destination Folder")
 librarian.sendSimpleSignal("trashEntry", "My Document")
@@ -162,6 +172,7 @@ librarian.sendSimpleSignal("setTags", "My Document,tag1;tag2;tag3")
 |--------|-----------|---------|
 | `lookupEntry` | `name` or `path` | UUID(s), newline-separated |
 | `importDocument` | `filepath` or `filepath,parent` | UUID |
+| `importImage` | `filepath` or `filepath,parent` | UUID |
 | `renameEntry` | `entry,newName` | `ok` |
 | `moveEntry` | `entry,parent` | `ok` |
 | `trashEntry` | `entry` | `ok` |

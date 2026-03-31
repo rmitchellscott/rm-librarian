@@ -7,6 +7,10 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QImage>
+#include <QPageSize>
+#include <QPainter>
+#include <QPdfWriter>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -306,7 +310,7 @@ static int findArgSeparator(const QString &input)
     if (input.length() > 36 && input[36] == ',' &&
         kUuidRe.match(input.left(36)).hasMatch())
         return 36;
-    return findArgSeparator(input);
+    return input.lastIndexOf(',');
 }
 
 
@@ -425,6 +429,93 @@ extern "C" char *importDocument(const char *params)
     return result(uuid);
 }
 
+
+extern "C" char *importImage(const char *params)
+{
+    if (!params || params[0] == '\0')
+        return error("empty input");
+
+    QString input = QString::fromUtf8(params);
+    QString filePath = input;
+    QString parent;
+
+    int sep = findArgSeparator(input);
+    if (sep > 0) {
+        filePath = input.left(sep);
+        QString parentInput = input.mid(sep + 1);
+        if (!parentInput.isEmpty()) {
+            RESOLVE(p, resolveId(parentInput));
+            parent = p;
+        }
+    }
+
+    QImage image(filePath);
+    if (image.isNull())
+        return error("failed to load image: " + filePath);
+
+    QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
+    QString timestamp = QString::number(QDateTime::currentMSecsSinceEpoch());
+    QString dir = xochitlDir();
+    QString visibleName = stripExtension(QFileInfo(filePath).fileName());
+
+    QString pdfPath = QString("%1/%2.pdf").arg(dir, uuid);
+
+    QPdfWriter writer(pdfPath);
+    writer.setPageSize(QPageSize(image.size(), QPageSize::Unit::Point));
+    writer.setPageMargins(QMarginsF(0, 0, 0, 0));
+    writer.setResolution(72);
+
+    QPainter painter(&writer);
+    if (!painter.isActive()) {
+        QFile::remove(pdfPath);
+        return error("failed to create PDF");
+    }
+    painter.drawImage(painter.viewport(), image);
+    painter.end();
+
+    QJsonObject metadata;
+    metadata["createdTime"] = timestamp;
+    metadata["lastModified"] = timestamp;
+    metadata["lastOpened"] = "0";
+    metadata["lastOpenedPage"] = 0;
+    metadata["parent"] = parent;
+    metadata["pinned"] = false;
+    metadata["type"] = "DocumentType";
+    metadata["visibleName"] = visibleName;
+
+    QFile metaFile(QString("%1/%2.metadata").arg(dir, uuid));
+    if (!metaFile.open(QIODevice::WriteOnly))
+        return error("failed to write metadata");
+    metaFile.write(QJsonDocument(metadata).toJson(QJsonDocument::Indented));
+    metaFile.close();
+
+    QJsonObject content;
+    content["coverPageNumber"] = 0;
+    content["documentMetadata"] = QJsonObject();
+    content["extraMetadata"] = QJsonObject();
+    content["fileType"] = "pdf";
+    content["fontName"] = QString();
+    content["formatVersion"] = 2;
+    content["lineHeight"] = -1;
+    content["margins"] = 125;
+    content["orientation"] = "portrait";
+    content["pageCount"] = 1;
+    content["pageTags"] = QJsonArray();
+    content["tags"] = QJsonArray();
+    content["textScale"] = 1;
+    content["transform"] = QJsonObject();
+
+    QFile contentFile(QString("%1/%2.content").arg(dir, uuid));
+    if (!contentFile.open(QIODevice::WriteOnly))
+        return error("failed to write content");
+    contentFile.write(QJsonDocument(content).toJson(QJsonDocument::Indented));
+    contentFile.close();
+
+    notifyLibrary(uuid);
+
+    qInfo() << "[librarian]: imported image" << filePath << "as" << visibleName << "uuid" << uuid;
+    return result(uuid);
+}
 
 #define REQUIRE_CTRL() do { \
     if (!g_libraryController || !g_engine) return error("extension not initialized"); \

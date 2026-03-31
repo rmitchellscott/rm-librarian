@@ -12,6 +12,12 @@ with
     xovi-message-broker$version = 1
 end
 
+export importImage
+with
+    xovi-message-broker$simpleSignal = "importImage"
+    xovi-message-broker$version = 1
+end
+
 export renameEntry
 with
     xovi-message-broker$simpleSignal = "renameEntry"
