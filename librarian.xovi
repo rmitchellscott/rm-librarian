@@ -1,5 +1,11 @@
 version 0.1.0
 
+export rescanLibrary
+with
+    xovi-message-broker$simpleSignal = "rescanLibrary"
+    xovi-message-broker$version = 1
+end
+
 export lookupEntry
 with
     xovi-message-broker$simpleSignal = "lookupEntry"

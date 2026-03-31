@@ -41,7 +41,7 @@ echo '>elookupEntry:My Folder/My Document' > /run/xovi-mb; cat /run/xovi-mb-out
 
 ### Import
 
-Import a file from the local filesystem. The file extension is stripped from the display name (e.g., `report.pdf` becomes `report`). Returns the new document's UUID.
+Import a PDF, EPUB, or `.rmdoc` file from the local filesystem. For PDF and EPUB, the file extension is stripped from the display name (e.g., `report.pdf` becomes `report`). For `.rmdoc` files, the archive is extracted directly — the embedded UUID, metadata, and page data are preserved as-is. Returns the document's UUID.
 
 ```bash
 # Import to root
@@ -49,6 +49,10 @@ echo '>eimportDocument:/path/to/file.pdf' > /run/xovi-mb; cat /run/xovi-mb-out
 
 # Import into a folder (by name or UUID)
 echo '>eimportDocument:/path/to/file.pdf,My Folder' > /run/xovi-mb; cat /run/xovi-mb-out
+
+# Import an rmdoc archive
+echo '>eimportDocument:/path/to/backup.rmdoc' > /run/xovi-mb; cat /run/xovi-mb-out
+echo '>eimportDocument:/path/to/backup.rmdoc,My Folder' > /run/xovi-mb; cat /run/xovi-mb-out
 ```
 
 ### Import Image
@@ -135,6 +139,14 @@ echo '>esetOrientation:My Document,portrait' > /run/xovi-mb; cat /run/xovi-mb-ou
 echo '>esetTags:My Document,tag1;tag2;tag3' > /run/xovi-mb; cat /run/xovi-mb-out
 ```
 
+### Rescan
+
+Scan the xochitl data directory and load any documents not yet known to the running library. Returns the number of new entries loaded.
+
+```bash
+echo '>erescanLibrary:' > /run/xovi-mb; cat /run/xovi-mb-out
+```
+
 ## QML Usage
 
 All signals are accessible from QML via the xovi-message-broker:
@@ -150,6 +162,7 @@ XoviMessageBroker { id: librarian }
 ```qml
 librarian.sendSimpleSignal("lookupEntry", "My Document")
 librarian.sendSimpleSignal("importDocument", "/tmp/report.pdf,My Folder")
+librarian.sendSimpleSignal("importDocument", "/tmp/backup.rmdoc")
 librarian.sendSimpleSignal("importImage", "/tmp/screenshot.png,Screenshots")
 librarian.sendSimpleSignal("renameEntry", "My Document,New Name")
 librarian.sendSimpleSignal("moveEntry", "My Document,Destination Folder")
@@ -160,8 +173,9 @@ librarian.sendSimpleSignal("cloneEntry", "My Document,Other Folder")
 librarian.sendSimpleSignal("createNotebook", "New Notebook,My Folder")
 librarian.sendSimpleSignal("createFolder", "New Folder,Parent Folder")
 librarian.sendSimpleSignal("ensureFolder", "Projects/2026/March")
+librarian.sendSimpleSignal("rescanLibrary", "")
 librarian.sendSimpleSignal("setPinned", "My Document,true")
-librarian.sendSimpleSignal("setCover", "My Document,3")
+librarian.sendSimpleSignal("setCover", "My Document,-1")
 librarian.sendSimpleSignal("setOrientation", "My Document,landscape")
 librarian.sendSimpleSignal("setTags", "My Document,tag1;tag2;tag3")
 ```
@@ -182,6 +196,7 @@ librarian.sendSimpleSignal("setTags", "My Document,tag1;tag2;tag3")
 | `createNotebook` | `name` or `name,parent` | `ok` |
 | `createFolder` | `name` or `name,parent` | `ok` |
 | `ensureFolder` | `name` or `path` | UUID |
+| `rescanLibrary` | *(none)* | count of new entries |
 | `setPinned` | `entry,true/false` | `ok` |
 | `setCover` | `entry,pageNumber` | `ok` |
 | `setOrientation` | `entry,portrait/landscape` | `ok` |

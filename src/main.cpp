@@ -11,6 +11,7 @@
 #include <QPageSize>
 #include <QPainter>
 #include <QPdfWriter>
+#include <QProcess>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -132,7 +133,7 @@ static QString detectFileType(const QString &suffix)
         return "pdf";
     if (suffix.compare("epub", Qt::CaseInsensitive) == 0)
         return "epub";
-    return "pdf";
+    return QString();
 }
 
 static void notifyLibrary(const QString &uuid)
@@ -314,6 +315,34 @@ static int findArgSeparator(const QString &input)
 }
 
 
+extern "C" char *rescanLibrary(const char *params)
+{
+    (void)params;
+    if (!g_library)
+        return error("library not resolved");
+    if (!g_library->property("isReady").toBool())
+        return error("library not ready");
+
+    QList<MetaEntry> entries = loadMetadataIndex();
+    int loaded = 0;
+
+    QMetaObject::invokeMethod(g_engine, [&entries, &loaded]() {
+        for (const MetaEntry &e : entries) {
+            QString parentId;
+            bool ok = QMetaObject::invokeMethod(g_library, "parentIdForId",
+                Qt::DirectConnection, Q_RETURN_ARG(QString, parentId),
+                Q_ARG(QString, e.uuid));
+            if (ok && parentId.isNull()) {
+                notifyLibrary(e.uuid);
+                loaded++;
+            }
+        }
+    }, Qt::BlockingQueuedConnection);
+
+    qInfo() << "[librarian]: rescanned" << entries.size() << "entries," << loaded << "new";
+    return result(QString::number(loaded));
+}
+
 extern "C" char *lookupEntry(const char *params)
 {
     if (!params || params[0] == '\0')
@@ -376,11 +405,69 @@ extern "C" char *importDocument(const char *params)
     if (!srcInfo.exists())
         return error("file does not exist: " + filePath);
 
+    QString dir = xochitlDir();
+    bool isRmdoc = srcInfo.suffix().compare("rmdoc", Qt::CaseInsensitive) == 0;
+
+    if (isRmdoc) {
+        QProcess listProc;
+        listProc.start("unzip", QStringList() << "-l" << srcInfo.absoluteFilePath());
+        if (!listProc.waitForFinished(5000)) {
+            if (listProc.error() == QProcess::FailedToStart)
+                return error("unzip not found");
+            return error("unzip listing timed out");
+        }
+        if (listProc.exitCode() != 0)
+            return error("failed to list rmdoc: " + QString::fromUtf8(listProc.readAllStandardError()));
+
+        QString uuid;
+        QString listing = QString::fromUtf8(listProc.readAllStandardOutput());
+        for (const QString &line : listing.split('\n')) {
+            QString name = line.simplified().section(' ', -1);
+            if (name.endsWith(".metadata") && !name.contains('/')) {
+                uuid = name.chopped(9);
+                break;
+            }
+        }
+        if (uuid.isEmpty())
+            return error("no .metadata found in rmdoc archive");
+
+        QProcess extractProc;
+        extractProc.start("unzip", QStringList() << "-o" << srcInfo.absoluteFilePath() << "-d" << dir);
+        if (!extractProc.waitForFinished(30000)) {
+            if (extractProc.error() == QProcess::FailedToStart)
+                return error("unzip not found");
+            return error("unzip extraction timed out");
+        }
+        if (extractProc.exitCode() != 0)
+            return error("unzip failed: " + QString::fromUtf8(extractProc.readAllStandardError()));
+
+        if (!parent.isEmpty()) {
+            QString metaPath = QString("%1/%2.metadata").arg(dir, uuid);
+            QFile metaFile(metaPath);
+            if (metaFile.open(QIODevice::ReadOnly)) {
+                QJsonObject meta = QJsonDocument::fromJson(metaFile.readAll()).object();
+                metaFile.close();
+                meta["parent"] = parent;
+                if (metaFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    metaFile.write(QJsonDocument(meta).toJson(QJsonDocument::Indented));
+                    metaFile.close();
+                }
+            }
+        }
+
+        notifyLibrary(uuid);
+
+        qInfo() << "[librarian]: imported rmdoc" << filePath << "uuid" << uuid;
+        return result(uuid);
+    }
+
+    QString fileType = detectFileType(srcInfo.suffix());
+    if (fileType.isEmpty())
+        return error("unsupported file type: " + srcInfo.suffix());
+
     QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
     QString timestamp = QString::number(QDateTime::currentMSecsSinceEpoch());
-    QString dir = xochitlDir();
     QString visibleName = stripExtension(srcInfo.fileName());
-    QString fileType = detectFileType(srcInfo.suffix());
 
     if (!QFile::copy(srcInfo.absoluteFilePath(), QString("%1/%2.%3").arg(dir, uuid, fileType)))
         return error("failed to copy file");
