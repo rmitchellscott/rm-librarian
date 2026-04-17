@@ -242,4 +242,6 @@ Builds for both architectures using Docker:
 
 ## License
 
-GPLv3
+Copyright (C) 2026 Mitchell Scott
+
+Licensed under the GNU General Public License v3.0.
