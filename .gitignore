@@ -1,9 +1,13 @@
 # Build artifacts
 *.so
 *.o
+*.a
 xovi.cpp
 xovi.h
 Makefile
+libs/
+.rmlines-src/
+.rmlines-build/
 
 # Qt build files
 .qmake.stash

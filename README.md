@@ -3,7 +3,8 @@
 [![rm1](https://img.shields.io/badge/rM1-supported-green)](https://remarkable.com/store/remarkable)
 [![rm2](https://img.shields.io/badge/rM2-supported-green)](https://remarkable.com/store/remarkable-2)
 [![rmpp](https://img.shields.io/badge/rMPP-supported-green)](https://remarkable.com/store/overview/remarkable-paper-pro)
-[![rmppm](https://img.shields.io/badge/rMPPM-supported-green)](https://remarkable.com/products/remarkable-paper/pro-move)
+[![rmppmove](https://img.shields.io/badge/rMPPMove-supported-green)](https://remarkable.com/products/remarkable-paper/pro-move)
+[![rmppure](https://img.shields.io/badge/rMPPure-supported-green)](https://remarkable.com/products/remarkable-paper/pure)
 <img src="assets/rm-librarian.svg" alt="rm-librarian Icon" width="125" align="right">
 <p align="justify">
 
@@ -13,6 +14,8 @@ A xovi extension that provides a programmatic interface to xochitl's document li
 
 - [xovi](https://github.com/asivery/rm-xovi-extensions) - Extension framework
     - xovi-message-broker - Required for shell and QML communication
+
+[librm_lines](https://github.com/RedTTGMoss/librm_lines) is statically linked into the binary to parse `.rm` (lines) files for `getContentPages`. It is bundled at build time and requires no separate installation.
 
 ## Installation
 
@@ -147,6 +150,15 @@ Scan the xochitl data directory and load any documents not yet known to the runn
 echo '>erescanLibrary:' > /run/xovi-mb; cat /run/xovi-mb-out
 ```
 
+### Content Pages
+
+List the page UUIDs in a document that contain non-deleted content — strokes, typed text, images, or highlights. Blank pages, and pages whose strokes were fully erased, are excluded even though their `.rm` files still exist. Returns the matching page UUIDs (newline-separated) in page order, or an empty response if none.
+
+```bash
+echo '>egetContentPages:My Notebook' > /run/xovi-mb; cat /run/xovi-mb-out
+echo '>egetContentPages:<doc-uuid>' > /run/xovi-mb; cat /run/xovi-mb-out
+```
+
 ## QML Usage
 
 All signals are accessible from QML via the xovi-message-broker:
@@ -174,6 +186,7 @@ librarian.sendSimpleSignal("createNotebook", "New Notebook,My Folder")
 librarian.sendSimpleSignal("createFolder", "New Folder,Parent Folder")
 librarian.sendSimpleSignal("ensureFolder", "Projects/2026/March")
 librarian.sendSimpleSignal("rescanLibrary", "")
+librarian.sendSimpleSignal("getContentPages", "My Notebook")
 librarian.sendSimpleSignal("setPinned", "My Document,true")
 librarian.sendSimpleSignal("setCover", "My Document,-1")
 librarian.sendSimpleSignal("setOrientation", "My Document,landscape")
@@ -197,6 +210,7 @@ librarian.sendSimpleSignal("setTags", "My Document,tag1;tag2;tag3")
 | `createFolder` | `name` or `name,parent` | `ok` |
 | `ensureFolder` | `name` or `path` | UUID |
 | `rescanLibrary` | *(none)* | count of new entries |
+| `getContentPages` | `entry` | page UUIDs with content, newline-separated |
 | `setPinned` | `entry,true/false` | `ok` |
 | `setCover` | `entry,pageNumber` | `ok` |
 | `setOrientation` | `entry,portrait/landscape` | `ok` |
@@ -232,11 +246,19 @@ echo '>emoveEntry:<doc-uuid>,<folder-uuid>' > /run/xovi-mb; cat /run/xovi-mb-out
 
 ## Building
 
+This repository vendors [librm_lines](https://github.com/RedTTGMoss/librm_lines) as a submodule. Clone with submodules, or initialize them in an existing clone:
+
+```bash
+git clone --recursive https://github.com/rmitchellscott/rm-librarian
+# or, in an existing clone:
+git submodule update --init
+```
+
 ```bash
 ./build.sh
 ```
 
-Builds for both architectures using Docker:
+Builds for both architectures using Docker, compiling librm_lines as a static library and linking it into the extension:
 - `librarian-aarch64.so` - reMarkable Paper Pro
 - `librarian-armv7.so` - reMarkable 2
 
@@ -245,3 +267,5 @@ Builds for both architectures using Docker:
 Copyright (C) 2026 Mitchell Scott
 
 Licensed under the GNU General Public License v3.0.
+
+This project statically links [librm_lines](https://github.com/RedTTGMoss/librm_lines) by RedTTG, also licensed under the GNU General Public License v3.0.

@@ -15,4 +15,6 @@ CONFIG += c++11
 
 SOURCES += src/main.cpp xovi.cpp
 
+LIBS += $$PWD/libs/librm_lines.a $$PWD/libs/libsimdutf.a
+
 QMAKE_CXXFLAGS += -fPIC

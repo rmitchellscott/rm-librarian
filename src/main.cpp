@@ -34,6 +34,12 @@ static QQmlEngine *g_engine = nullptr;
 static QObject *g_library = nullptr;
 static QObject *g_libraryController = nullptr;
 
+extern "C" {
+    const char *buildTree(const char *rmPath);
+    const char *convertToJson(const char *treeId);
+    int destroyTree(const char *treeId);
+}
+
 
 static bool ensureEngine()
 {
@@ -607,6 +613,106 @@ extern "C" char *importImage(const char *params)
 #define REQUIRE_CTRL() do { \
     if (!g_libraryController || !g_engine) return error("extension not initialized"); \
 } while(0)
+
+static bool sceneHasInk(const QJsonObject &root)
+{
+    const QJsonValue rootText = root.value("rootText");
+    if (rootText.isObject() && !rootText.toObject().isEmpty())
+        return true;
+
+    static const int kEraserTool = 6;
+    static const int kEraserAreaTool = 8;
+
+    const QJsonObject nodes = root.value("nodes").toObject();
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        const QJsonObject node = it.value().toObject();
+        if (!node.value("visible").toObject().value("value").toBool(true))
+            continue;
+        const QJsonValue childrenVal = node.value("children");
+        if (!childrenVal.isArray())
+            continue;
+        for (const QJsonValue &cv : childrenVal.toArray()) {
+            const QJsonObject item = cv.toObject();
+            const QString type = item.value("_type").toString();
+            if (type != QLatin1String("Line") && type != QLatin1String("Image")
+                && type != QLatin1String("Text") && type != QLatin1String("GlyphRange"))
+                continue;
+            if (item.value("deletedLength").toInt() != 0)
+                continue;
+            const QJsonValue value = item.value("value");
+            if (value.isNull() || value.isUndefined())
+                continue;
+            if (type == QLatin1String("Line")) {
+                const QJsonObject line = value.toObject();
+                const int tool = line.value("tool").toInt(-1);
+                if (tool == kEraserTool || tool == kEraserAreaTool)
+                    continue;
+                if (line.value("points").toArray().isEmpty())
+                    continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rmFileHasInk(const QString &rmPath)
+{
+    const QByteArray pathBytes = rmPath.toUtf8();
+    const char *tid = buildTree(pathBytes.constData());
+    if (!tid || !*tid)
+        return false;
+    const QByteArray treeId(tid);
+    bool ink = false;
+    const char *js = convertToJson(treeId.constData());
+    if (js)
+        ink = sceneHasInk(QJsonDocument::fromJson(QByteArray(js)).object());
+    destroyTree(treeId.constData());
+    return ink;
+}
+
+extern "C" char *getContentPages(const char *params)
+{
+    QString input = QString::fromUtf8(params ? params : "");
+    if (input.isEmpty())
+        return error("empty input");
+    RESOLVE(uuid, resolveId(input));
+
+    const QString dir = xochitlDir();
+    QFile cf(QString("%1/%2.content").arg(dir, uuid));
+    if (!cf.open(QIODevice::ReadOnly))
+        return error("cannot read content for " + uuid);
+    const QJsonObject content = QJsonDocument::fromJson(cf.readAll()).object();
+    cf.close();
+
+    QStringList pageIds;
+    const QJsonObject cPages = content.value("cPages").toObject();
+    if (cPages.contains("pages")) {
+        for (const QJsonValue &pv : cPages.value("pages").toArray()) {
+            const QJsonObject po = pv.toObject();
+            if (po.contains("deleted"))
+                continue;
+            const QString id = po.value("id").toString();
+            if (!id.isEmpty())
+                pageIds << id;
+        }
+    } else {
+        for (const QJsonValue &pv : content.value("pages").toArray())
+            if (!pv.toString().isEmpty())
+                pageIds << pv.toString();
+    }
+
+    const QString pdir = QString("%1/%2").arg(dir, uuid);
+    QStringList inked;
+    for (const QString &pid : pageIds) {
+        const QString rm = QString("%1/%2.rm").arg(pdir, pid);
+        if (QFile::exists(rm) && rmFileHasInk(rm))
+            inked << pid;
+    }
+
+    qInfo() << "[librarian]: getContentPages" << uuid << inked.size() << "of" << pageIds.size();
+    return strdup(inked.join('\n').toUtf8().constData());
+}
 
 extern "C" char *renameEntry(const char *params)
 {

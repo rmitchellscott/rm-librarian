@@ -1,4 +1,4 @@
-version 0.3.1
+version 0.4.0
 
 export rescanLibrary
 with
@@ -99,5 +99,11 @@ end
 export setTags
 with
     xovi-message-broker$simpleSignal = "setTags"
+    xovi-message-broker$version = 1
+end
+
+export getContentPages
+with
+    xovi-message-broker$simpleSignal = "getContentPages"
     xovi-message-broker$version = 1
 end

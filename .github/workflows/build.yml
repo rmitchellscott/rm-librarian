@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Download xovi release
         run: |
@@ -45,15 +47,7 @@ jobs:
             -v "${{ github.workspace }}:/build" \
             -w /build \
             ${{ matrix.docker_image }} \
-            bash -c '
-              set -ex
-              . /opt/codex/*/*/environment-setup-*
-              export XOVI_REPO=/build/xovi-repo
-              python3 $XOVI_REPO/util/xovigen.py -o xovi.cpp -H xovi.h librarian.xovi
-              qmake .
-              make
-              mv librarian.so librarian-${{ matrix.arch }}.so
-            '
+            bash /build/build.sh ${{ matrix.arch }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
