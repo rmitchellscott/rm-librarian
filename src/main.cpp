@@ -33,6 +33,7 @@
 static QQmlEngine *g_engine = nullptr;
 static QObject *g_library = nullptr;
 static QObject *g_libraryController = nullptr;
+static QObject *g_invoker = nullptr;
 
 extern "C" {
     const char *buildTree(const char *rmPath);
@@ -58,7 +59,7 @@ static bool ensureEngine()
 
 static bool resolveLibrary()
 {
-    if (g_library)
+    if (g_library && g_invoker)
         return true;
 
     if (!ensureEngine())
@@ -66,10 +67,24 @@ static bool resolveLibrary()
 
     static const char *kHelperQml = R"QML(
         import QtQml
-        import com.remarkable 1.0 as RM
+        import xofm.libs.library
         QtObject {
-            property var lib: RM.Library
-            property var ctrl: RM.LibraryController
+            property var lib: Library
+            property var ctrl: LibraryController
+            function callCtrl(m, a) { return LibraryController[m].apply(LibraryController, a); }
+            function callLib(m, a) { return Library[m].apply(Library, a); }
+            function idList(uuids) {
+                var a = [];
+                for (var i = 0; i < uuids.length; ++i) {
+                    var w = Library.entryForId(uuids[i]);
+                    if (w) a.push(w.id);
+                }
+                return a;
+            }
+            function callList(m, uuids, rest) {
+                return LibraryController[m].apply(LibraryController, [idList(uuids)].concat(rest));
+            }
+            function notify(id) { Library.requestLoadEntry(id); Library.entryAdded(id); }
         }
     )QML";
 
@@ -90,6 +105,7 @@ static bool resolveLibrary()
         qWarning() << "[librarian]: Library not found";
         return false;
     }
+    g_invoker = holder;
     g_library = lib;
     qInfo() << "[librarian]: Library resolved";
 
@@ -103,6 +119,49 @@ static bool resolveLibrary()
     }
 
     return true;
+}
+
+static QVariant callInvoker(const char *fn, const QString &method, const QVariantList &args)
+{
+    QVariant ret;
+    QMetaObject::invokeMethod(g_invoker, fn, Qt::DirectConnection,
+        Q_RETURN_ARG(QVariant, ret),
+        Q_ARG(QVariant, QVariant(method)),
+        Q_ARG(QVariant, QVariant(args)));
+    return ret;
+}
+
+static QVariant ctrlCall(const QString &method, const QVariantList &args)
+{
+    return callInvoker("callCtrl", method, args);
+}
+
+static QVariant libCall(const QString &method, const QVariantList &args)
+{
+    return callInvoker("callLib", method, args);
+}
+
+static QVariant ctrlCallList(const QString &method, const QStringList &uuids,
+                             const QVariantList &rest = {})
+{
+    QVariant ret;
+    QMetaObject::invokeMethod(g_invoker, "callList", Qt::DirectConnection,
+        Q_RETURN_ARG(QVariant, ret),
+        Q_ARG(QVariant, QVariant(method)),
+        Q_ARG(QVariant, QVariant(uuids)),
+        Q_ARG(QVariant, QVariant(rest)));
+    return ret;
+}
+
+static QString variantToId(QVariant v)
+{
+    if (!v.isValid())
+        return QString();
+    if (v.typeId() == QMetaType::QString)
+        return v.toString();
+    if (v.convert(QMetaType(QMetaType::QString)))
+        return v.toString();
+    return QString();
 }
 
 static void ensureInitialization()
@@ -144,18 +203,11 @@ static QString detectFileType(const QString &suffix)
 
 static void notifyLibrary(const QString &uuid)
 {
-    if (!g_library)
+    if (!g_invoker)
         return;
 
-    const QMetaObject *mo = g_library->metaObject();
-
-    int loadIdx = mo->indexOfSignal("requestLoadEntry(QString)");
-    if (loadIdx >= 0)
-        mo->method(loadIdx).invoke(g_library, Qt::QueuedConnection, Q_ARG(QString, uuid));
-
-    int addIdx = mo->indexOfSignal("entryAdded(QString)");
-    if (addIdx >= 0)
-        mo->method(addIdx).invoke(g_library, Qt::QueuedConnection, Q_ARG(QString, uuid));
+    QMetaObject::invokeMethod(g_invoker, "notify", Qt::QueuedConnection,
+        Q_ARG(QVariant, QVariant(uuid)));
 }
 
 static QString createFolderOnDisk(const QString &name, const QString &parentId)
@@ -334,11 +386,8 @@ extern "C" char *rescanLibrary(const char *params)
 
     QMetaObject::invokeMethod(g_engine, [&entries, &loaded]() {
         for (const MetaEntry &e : entries) {
-            QString parentId;
-            bool ok = QMetaObject::invokeMethod(g_library, "parentIdForId",
-                Qt::DirectConnection, Q_RETURN_ARG(QString, parentId),
-                Q_ARG(QString, e.uuid));
-            if (ok && parentId.isNull()) {
+            QString parentId = variantToId(libCall("parentIdForId", { e.uuid }));
+            if (parentId.isEmpty()) {
                 notifyLibrary(e.uuid);
                 loaded++;
             }
@@ -611,7 +660,7 @@ extern "C" char *importImage(const char *params)
 }
 
 #define REQUIRE_CTRL() do { \
-    if (!g_libraryController || !g_engine) return error("extension not initialized"); \
+    if (!g_libraryController || !g_invoker || !g_engine) return error("extension not initialized"); \
 } while(0)
 
 static bool sceneHasInk(const QJsonObject &root)
@@ -725,14 +774,12 @@ extern "C" char *renameEntry(const char *params)
     QString newName = input.mid(sep + 1);
     if (newName.isEmpty()) return error("new name is empty");
 
-    QMetaObject::invokeMethod(g_engine, [id, newName]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setVisibleName",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(QString, newName));
-        qInfo() << "[librarian]: rename" << id << "→" << newName << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCall("setVisibleName", { id, newName }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: rename" << id << "→" << newName << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *moveEntry(const char *params)
@@ -750,14 +797,12 @@ extern "C" char *moveEntry(const char *params)
         parentId = p;
     }
 
-    QMetaObject::invokeMethod(g_engine, [id, parentId]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "moveEntry",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(QString, parentId));
-        qInfo() << "[librarian]: move" << id << "→" << parentId << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCallList("moveEntries", { id }, { parentId }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: move" << id << "→" << parentId << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *trashEntry(const char *params)
@@ -765,14 +810,12 @@ extern "C" char *trashEntry(const char *params)
     REQUIRE_CTRL();
     RESOLVE(id, resolveId(QString::fromUtf8(params ? params : "")));
 
-    QMetaObject::invokeMethod(g_engine, [id]() {
-        QStringList ids = { id };
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "moveEntriesToTrash",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok), Q_ARG(QStringList, ids));
-        qInfo() << "[librarian]: trash" << id << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCallList("moveEntriesToTrash", { id }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: trash" << id << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *restoreEntry(const char *params)
@@ -780,14 +823,12 @@ extern "C" char *restoreEntry(const char *params)
     REQUIRE_CTRL();
     RESOLVE(id, resolveIdInTrash(QString::fromUtf8(params ? params : "")));
 
-    QMetaObject::invokeMethod(g_engine, [id]() {
-        QStringList ids = { id };
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "restoreEntriesFromTrash",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok), Q_ARG(QStringList, ids));
-        qInfo() << "[librarian]: restore" << id << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCallList("restoreEntriesFromTrash", { id }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: restore" << id << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *deleteEntry(const char *params)
@@ -795,14 +836,12 @@ extern "C" char *deleteEntry(const char *params)
     REQUIRE_CTRL();
     RESOLVE(id, resolveId(QString::fromUtf8(params ? params : "")));
 
-    QMetaObject::invokeMethod(g_engine, [id]() {
-        QStringList ids = { id };
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "deleteEntries",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok), Q_ARG(QStringList, ids));
-        qInfo() << "[librarian]: delete" << id << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCallList("deleteEntries", { id }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: delete" << id << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *cloneEntry(const char *params)
@@ -820,14 +859,12 @@ extern "C" char *cloneEntry(const char *params)
         parentId = p;
     }
 
-    QMetaObject::invokeMethod(g_engine, [id, parentId]() {
-        QString newId;
-        QMetaObject::invokeMethod(g_libraryController, "cloneEntry",
-            Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-            Q_ARG(QString, id), Q_ARG(QString, parentId));
-        qInfo() << "[librarian]: clone" << id << "→" << newId;
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    QString newId;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        newId = variantToId(ctrlCall("cloneEntry", { id, parentId }));
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: clone" << id << "→" << newId;
+    return result(newId);
 }
 
 extern "C" char *createNotebook(const char *params)
@@ -848,14 +885,12 @@ extern "C" char *createNotebook(const char *params)
     }
     if (name.isEmpty()) return error("name is empty");
 
-    QMetaObject::invokeMethod(g_engine, [name, parentId]() {
-        QString newId;
-        QMetaObject::invokeMethod(g_libraryController, "createDocument",
-            Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-            Q_ARG(QString, parentId), Q_ARG(QString, name));
-        qInfo() << "[librarian]: createNotebook" << name << "→" << newId;
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    QString newId;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        newId = variantToId(ctrlCall("createDocument", { parentId, name }));
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: createNotebook" << name << "→" << newId;
+    return result(newId);
 }
 
 extern "C" char *setPinned(const char *params)
@@ -868,14 +903,12 @@ extern "C" char *setPinned(const char *params)
     RESOLVE(id, resolveId(input.left(sep)));
     bool pinned = input.mid(sep + 1).trimmed().compare("true", Qt::CaseInsensitive) == 0;
 
-    QMetaObject::invokeMethod(g_engine, [id, pinned]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setPinned",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(bool, pinned));
-        qInfo() << "[librarian]: setPinned" << id << pinned << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCall("setPinned", { id, pinned }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: setPinned" << id << pinned << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *setCover(const char *params)
@@ -888,14 +921,12 @@ extern "C" char *setCover(const char *params)
     RESOLVE(id, resolveId(input.left(sep)));
     int page = input.mid(sep + 1).trimmed().toInt();
 
-    QMetaObject::invokeMethod(g_engine, [id, page]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setCoverPageNumber",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(int, page));
-        qInfo() << "[librarian]: setCover" << id << page << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCall("setCoverPageNumber", { id, page }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: setCover" << id << page << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *setOrientation(const char *params)
@@ -909,14 +940,12 @@ extern "C" char *setOrientation(const char *params)
     QString val = input.mid(sep + 1).trimmed().toLower();
     int orientation = (val == "landscape" || val == "horizontal") ? Qt::Horizontal : Qt::Vertical;
 
-    QMetaObject::invokeMethod(g_engine, [id, orientation]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setOrientation",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(Qt::Orientation, static_cast<Qt::Orientation>(orientation)));
-        qInfo() << "[librarian]: setOrientation" << id << orientation << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCall("setOrientation", { id, orientation }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: setOrientation" << id << orientation << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *setTags(const char *params)
@@ -929,15 +958,12 @@ extern "C" char *setTags(const char *params)
     RESOLVE(id, resolveId(input.left(sep)));
     QStringList tags = input.mid(sep + 1).split(';', Qt::SkipEmptyParts);
 
-    QMetaObject::invokeMethod(g_engine, [id, tags]() {
-        QStringList partial;
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setEntryTags",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(QStringList, tags), Q_ARG(QStringList, partial));
-        qInfo() << "[librarian]: setTags" << id << tags << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    bool ok = false;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        ok = ctrlCall("setEntryTags", { id, tags, QStringList() }).toBool();
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: setTags" << id << tags << (ok ? "ok" : "FAILED");
+    return strdup(ok ? "ok" : "FAILED");
 }
 
 extern "C" char *createFolder(const char *params)
@@ -958,18 +984,12 @@ extern "C" char *createFolder(const char *params)
     }
     if (name.isEmpty()) return error("name is empty");
 
-    QMetaObject::invokeMethod(g_engine, [name, parentId]() {
-        QString newId;
-        QMetaObject::invokeMethod(g_libraryController, "createCollectionWrapper",
-            Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-            Q_ARG(QString, parentId), Q_ARG(QString, name));
-        if (newId.isEmpty())
-            QMetaObject::invokeMethod(g_library, "createCollectionWrapper",
-                Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-                Q_ARG(QString, parentId), Q_ARG(QString, name));
-        qInfo() << "[librarian]: createFolder" << name << "→" << newId;
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    QString newId;
+    QMetaObject::invokeMethod(g_engine, [&]() {
+        newId = variantToId(libCall("createCollection", { parentId, name }));
+    }, Qt::BlockingQueuedConnection);
+    qInfo() << "[librarian]: createFolder" << name << "→" << newId;
+    return result(newId);
 }
 
 extern "C" char *ensureFolder(const char *params)
