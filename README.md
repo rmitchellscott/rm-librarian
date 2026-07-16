@@ -159,6 +159,20 @@ echo '>egetContentPages:My Notebook' > /run/xovi-mb; cat /run/xovi-mb-out
 echo '>egetContentPages:<doc-uuid>' > /run/xovi-mb; cat /run/xovi-mb-out
 ```
 
+## Testing
+
+The repository includes [scripts/test-librarian.sh](/run/media/lurenmax/Data/work/4_workspace/remarkable/rm-librarian/scripts/test-librarian.sh) for end-to-end validation of the extension.
+
+- Run this script on the reMarkable device, not on a desktop development machine.
+- It talks to the live `xovi-message-broker` pipes and verifies each library operation against the device's real xochitl state.
+- The script is intended to check the correctness of each supported feature, including create, import, rename, move, clone, trash, restore, delete, metadata updates, and rescan behavior.
+
+Example:
+
+```bash
+bash scripts/test-librarian.sh
+```
+
 ## QML Usage
 
 All signals are accessible from QML via the xovi-message-broker:
