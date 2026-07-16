@@ -144,7 +144,7 @@ echo '>esetTags:My Document,tag1;tag2;tag3' > /run/xovi-mb; cat /run/xovi-mb-out
 
 ### Rescan
 
-Scan the xochitl data directory and load any documents not yet known to the running library. Returns the number of new entries loaded.
+Scan the xochitl data directory and try to load entries that exist on disk but are still missing from the running library. Returns the number of entries that were poked for runtime loading. This is mainly useful after direct filesystem changes.
 
 ```bash
 echo '>erescanLibrary:' > /run/xovi-mb; cat /run/xovi-mb-out
@@ -205,11 +205,11 @@ librarian.sendSimpleSignal("setTags", "My Document,tag1;tag2;tag3")
 | `trashEntry` | `entry` | `ok` |
 | `restoreEntry` | `entry` | `ok` |
 | `deleteEntry` | `entry` | `ok` |
-| `cloneEntry` | `entry,parent` | `ok` |
-| `createNotebook` | `name` or `name,parent` | `ok` |
-| `createFolder` | `name` or `name,parent` | `ok` |
+| `cloneEntry` | `entry,parent` | UUID |
+| `createNotebook` | `name` or `name,parent` | UUID |
+| `createFolder` | `name` or `name,parent` | UUID |
 | `ensureFolder` | `name` or `path` | UUID |
-| `rescanLibrary` | *(none)* | count of new entries |
+| `rescanLibrary` | *(none)* | count of runtime-missing filesystem entries loaded |
 | `getContentPages` | `entry` | page UUIDs with content, newline-separated |
 | `setPinned` | `entry,true/false` | `ok` |
 | `setCover` | `entry,pageNumber` | `ok` |

@@ -1,12 +1,15 @@
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QHash>
 #include <QImage>
 #include <QPageSize>
 #include <QPainter>
@@ -22,8 +25,11 @@
 #include <QQmlEngine>
 #include <QQmlError>
 #include <QRegularExpression>
+#include <QSet>
+#include <QThread>
 #include <QTimer>
 #include <QUuid>
+#include <QUrl>
 #include <QVariant>
 #include <QWindow>
 #include <QtDebug>
@@ -33,6 +39,9 @@
 static QQmlEngine *g_engine = nullptr;
 static QObject *g_library = nullptr;
 static QObject *g_libraryController = nullptr;
+static QObject *g_bridge = nullptr;
+static QObject *g_documentImporter = nullptr;
+static QHash<QString, QString> g_preTrashParents;
 
 extern "C" {
     const char *buildTree(const char *rmPath);
@@ -40,19 +49,332 @@ extern "C" {
     int destroyTree(const char *treeId);
 }
 
+static QString describeObject(const QObject *obj)
+{
+    if (!obj)
+        return "null";
+    const QMetaObject *mo = obj->metaObject();
+    return QString("%1(name=%2, addr=%3)")
+        .arg(mo ? mo->className() : "QObject",
+             obj->objectName().isEmpty() ? "<empty>" : obj->objectName(),
+             QString::number(reinterpret_cast<quintptr>(obj), 16));
+}
+
+static QString describeVariant(const QVariant &value)
+{
+    const char *typeName = value.typeName();
+    QString rendered = value.toString();
+    if (rendered.isEmpty())
+        rendered = "<empty>";
+    return QString("valid=%1, type=%2, value=%3")
+        .arg(value.isValid() ? "true" : "false",
+             typeName ? typeName : "<null>",
+             rendered);
+}
+
+static void logObjectMethods(const char *label, const QObject *obj)
+{
+    if (!obj) {
+        qInfo() << "[librarian]:" << label << "object is null";
+        return;
+    }
+
+    const QMetaObject *mo = obj->metaObject();
+    qInfo() << "[librarian]:" << label << "metaobject =" << (mo ? mo->className() : "<null>");
+    if (!mo)
+        return;
+
+    for (int i = mo->methodOffset(); i < mo->methodCount(); ++i)
+        qInfo() << "[librarian]:" << label << "method" << mo->method(i).methodSignature();
+}
+
+static bool shouldLogAllMethods()
+{
+    const QByteArray value = qgetenv("LIBRARIAN_LOG_ALL_METHODS").trimmed().toLower();
+    return value == "1" || value == "true" || value == "yes";
+}
+
+static QObject *createHelperAndResolve(
+    QQmlEngine *engine,
+    const char *label,
+    const char *qmlSource,
+    QObject **outHolder,
+    QVariant *outLibraryValue,
+    QVariant *outControllerValue)
+{
+    QQmlComponent component(engine);
+    component.setData(qmlSource, QUrl());
+    qInfo() << "[librarian]:" << label << "component status after setData =" << component.status();
+    const auto componentErrors = component.errors();
+    for (const QQmlError &error : componentErrors)
+        qWarning() << "[librarian]:" << label << "component diagnostic:" << error;
+
+    QObject *holder = component.create(engine->rootContext());
+    if (!holder) {
+        const auto errors = component.errors();
+        for (const QQmlError &error : errors)
+            qWarning() << "[librarian]:" << label << "QML helper error:" << error;
+        return nullptr;
+    }
+
+    holder->setParent(engine);
+    qInfo() << "[librarian]:" << label << "helper object created:" << describeObject(holder);
+
+    QVariant libValue = holder->property("lib");
+    QVariant ctrlValue = holder->property("ctrl");
+    qInfo() << "[librarian]:" << label << "helper property lib:" << describeVariant(libValue);
+    qInfo() << "[librarian]:" << label << "helper property ctrl:" << describeVariant(ctrlValue);
+
+    if (outHolder)
+        *outHolder = holder;
+    if (outLibraryValue)
+        *outLibraryValue = libValue;
+    if (outControllerValue)
+        *outControllerValue = ctrlValue;
+    return libValue.isValid() ? libValue.value<QObject *>() : nullptr;
+}
+
+static bool invokeBridge0(const char *method, QVariant *ret = nullptr)
+{
+    if (!g_bridge)
+        return false;
+    if (ret)
+        return QMetaObject::invokeMethod(
+            g_bridge, method, Qt::DirectConnection, Q_RETURN_ARG(QVariant, *ret));
+    return QMetaObject::invokeMethod(g_bridge, method, Qt::DirectConnection);
+}
+
+static bool invokeBridge1(const char *method, const QVariant &arg1, QVariant *ret = nullptr)
+{
+    if (!g_bridge)
+        return false;
+    if (ret)
+        return QMetaObject::invokeMethod(
+            g_bridge, method, Qt::DirectConnection, Q_RETURN_ARG(QVariant, *ret), Q_ARG(QVariant, arg1));
+    return QMetaObject::invokeMethod(g_bridge, method, Qt::DirectConnection, Q_ARG(QVariant, arg1));
+}
+
+static bool invokeBridge2(const char *method, const QVariant &arg1, const QVariant &arg2, QVariant *ret = nullptr)
+{
+    if (!g_bridge)
+        return false;
+    if (ret)
+        return QMetaObject::invokeMethod(
+            g_bridge, method, Qt::DirectConnection, Q_RETURN_ARG(QVariant, *ret),
+            Q_ARG(QVariant, arg1), Q_ARG(QVariant, arg2));
+    return QMetaObject::invokeMethod(
+        g_bridge, method, Qt::DirectConnection, Q_ARG(QVariant, arg1), Q_ARG(QVariant, arg2));
+}
+
+static bool invokeBridge3(
+    const char *method,
+    const QVariant &arg1,
+    const QVariant &arg2,
+    const QVariant &arg3,
+    QVariant *ret = nullptr)
+{
+    if (!g_bridge)
+        return false;
+    if (ret)
+        return QMetaObject::invokeMethod(
+            g_bridge, method, Qt::DirectConnection, Q_RETURN_ARG(QVariant, *ret),
+            Q_ARG(QVariant, arg1), Q_ARG(QVariant, arg2), Q_ARG(QVariant, arg3));
+    return QMetaObject::invokeMethod(
+        g_bridge, method, Qt::DirectConnection,
+        Q_ARG(QVariant, arg1), Q_ARG(QVariant, arg2), Q_ARG(QVariant, arg3));
+}
+
+static bool libraryHasEntry(const QString &uuid)
+{
+    QVariant hasEntryValue;
+    return invokeBridge1("hasEntry", uuid, &hasEntryValue) && hasEntryValue.toBool();
+}
+
+static bool runOnEngineSync(const std::function<void()> &fn)
+{
+    if (!g_engine)
+        return false;
+    return QMetaObject::invokeMethod(g_engine, fn, Qt::BlockingQueuedConnection);
+}
+
+static QByteArray buildHelperQml(const char *importLine, const char *libExpr, const char *ctrlExpr)
+{
+    static const char *kHelperBody = R"QML(
+        QtObject {
+            property var lib: %1
+            property var ctrl: %2
+            property var importer: typeof DocumentImporter !== "undefined" ? DocumentImporter : undefined
+            function normalizeEntryId(id) {
+                if (!lib || id === null || id === undefined || id === "")
+                    return id;
+                const entry = lib.entryForId(id);
+                return entry ? entry.id : id;
+            }
+            function normalizeFolderHandle(id) {
+                if (!lib || id === null || id === undefined || id === "")
+                    return id;
+                const entry = lib.entryForId(id);
+                if (!entry)
+                    return id;
+                const entityId = lib.entityIdForEntry(entry);
+                return entityId && entityId.toString ? entityId.toString() : id;
+            }
+            function libraryIsReady() { return !!lib && !!lib.isReady }
+            function hasEntry(id) { return !!lib && !!id && !!lib.entryForId(id) }
+            function parentIdForId(id) { return lib ? lib.parentIdForId(normalizeEntryId(id)) : null }
+            function pokeLibraryEntry(id) {
+                if (!lib)
+                    return false;
+                const normalized = normalizeEntryId(id);
+                if (lib.requestLoadEntry)
+                    lib.requestLoadEntry(normalized);
+                if (lib.entryAdded)
+                    lib.entryAdded(normalized);
+                return true;
+            }
+            function setVisibleName(id, name) {
+                const normalized = lib ? normalizeEntryId(id) : "";
+                if (!ctrl || !normalized)
+                    return false;
+                ctrl.setVisibleName(normalized, name);
+                return true;
+            }
+            function moveEntry(id, parentId) {
+                if (!ctrl)
+                    return false;
+                const normalized = normalizeEntryId(id);
+                if (!normalized)
+                    return false;
+                return ctrl.moveEntries([normalized], parentId);
+            }
+            function moveSingleEntryToTrash(id) {
+                const normalized = normalizeEntryId(id);
+                return ctrl ? ctrl.moveEntriesToTrash([normalized]) : false;
+            }
+            function restoreSingleEntryFromTrash(id) {
+                const normalized = normalizeEntryId(id);
+                return ctrl ? ctrl.restoreEntriesFromTrash([normalized]) : false;
+            }
+            function deleteSingleEntry(id) {
+                const normalized = normalizeEntryId(id);
+                return ctrl ? ctrl.deleteEntries([normalized]) : false;
+            }
+            function cloneEntry(id, parentId) { return ctrl ? ctrl.cloneEntry(normalizeEntryId(id), parentId) : "" }
+            function createDocument(parentId, name) {
+                const normalizedParent = normalizeFolderHandle(parentId);
+                return ctrl ? ctrl.createDocument(normalizedParent, name) : "";
+            }
+            function setPinned(id, pinned) { return ctrl ? ctrl.setPinned(normalizeEntryId(id), pinned) : false }
+            function setCoverPageNumber(id, page) { return ctrl ? ctrl.setCoverPageNumber(normalizeEntryId(id), page) : false }
+            function setOrientation(id, orientation) { return ctrl ? ctrl.setOrientation(normalizeEntryId(id), orientation) : false }
+            function setEntryTags(id, tags, partial) { return ctrl ? ctrl.setEntryTags(normalizeEntryId(id), tags, partial) : false }
+            function createFolder(parentId, name) { return lib ? lib.createCollection(parentId, name) : "" }
+            function importKeyForPath(path) {
+                return path ? (path.indexOf("file:") === 0 ? path : "file://" + path) : "";
+            }
+            function findImportKey(path) {
+                const directKey = importKeyForPath(path);
+                if (importResults[directKey] !== undefined)
+                    return directKey;
+
+                for (const key in importResults) {
+                    if (!Object.prototype.hasOwnProperty.call(importResults, key))
+                        continue;
+                    if (key === directKey || key.endsWith("/" + path) || key.endsWith(path))
+                        return key;
+                    const result = importResults[key];
+                    if (result && result.name === path)
+                        return key;
+                }
+                return directKey;
+            }
+            function importFromFile(path, parentId) {
+                const url = importKeyForPath(path);
+                delete importResults[url];
+                if (!importer) {
+                    importResults[url] = {status: "missing-importer", id: "", finished: true};
+                    return url;
+                }
+                const normalizedParent = parentId ? normalizeEntryId(parentId) : "";
+                importer.importFromUrls([url], normalizedParent);
+                return url;
+            }
+            function importStatus(path) {
+                const url = findImportKey(path);
+                const result = importResults[url];
+                return result ? JSON.stringify(result) : "";
+            }
+            property var importResults: ({})
+            property var importerConnections: Connections {
+                target: importer
+                ignoreUnknownSignals: true
+                function onStarted(name, url) {
+                    const key = url.toString();
+                    importResults[key] = {status: "started", name: name, id: "", finished: false};
+                }
+                function onImported(document, collection, url) {
+                    const key = url.toString();
+                    const id = document && document.id !== undefined ? document.id.toString() : "";
+                    const parentId = collection && collection.id !== undefined ? collection.id.toString() : "";
+                    importResults[key] = {status: "imported", id: id, parentId: parentId, finished: false};
+                }
+                function onFailed(url) {
+                    const key = url.toString();
+                    importResults[key] = {status: "failed", id: "", finished: false};
+                }
+                function onFinished(url) {
+                    const key = url.toString();
+                    const result = importResults[key] || {};
+                    result.finished = true;
+                    if (!result.status)
+                        result.status = "finished";
+                    importResults[key] = result;
+                }
+            }
+            property var libraryImportConnections: Connections {
+                target: lib
+                ignoreUnknownSignals: true
+                function onEntryImported(path, id) {
+                    const key = findImportKey(path);
+                    const result = importResults[key] || {};
+                    result.status = "imported";
+                    result.id = id !== undefined && id !== null ? id.toString() : "";
+                    importResults[key] = result;
+                }
+            }
+        }
+    )QML";
+
+    return QString("import QtQml\n%1\n%2")
+        .arg(QString::fromUtf8(importLine),
+             QString::fromUtf8(kHelperBody).arg(
+                 QString::fromUtf8(libExpr),
+                 QString::fromUtf8(ctrlExpr)))
+        .toUtf8();
+}
 
 static bool ensureEngine()
 {
     if (g_engine)
         return true;
     const auto windows = QGuiApplication::allWindows();
+    qInfo() << "[librarian]: ensureEngine scanning" << windows.size() << "windows";
     for (QWindow *window : windows) {
         QQmlEngine *engine = qmlEngine(window);
+        qInfo() << "[librarian]: window"
+                << window
+                << "title=" << window->title()
+                << "objectName=" << window->objectName()
+                << "visible=" << window->isVisible()
+                << "engine=" << engine;
         if (engine) {
             g_engine = engine;
+            qInfo() << "[librarian]: selected engine" << engine
+                    << "rootContext=" << engine->rootContext();
             return true;
         }
     }
+    qWarning() << "[librarian]: ensureEngine found no QML engine";
     return false;
 }
 
@@ -64,42 +386,73 @@ static bool resolveLibrary()
     if (!ensureEngine())
         return false;
 
-    static const char *kHelperQml = R"QML(
-        import QtQml
-        import com.remarkable 1.0 as RM
-        QtObject {
-            property var lib: RM.Library
-            property var ctrl: RM.LibraryController
-        }
-    )QML";
+    const QByteArray directHelperQml = buildHelperQml(
+        "import com.remarkable\nimport xofm.libs.library",
+        "typeof Library !== \"undefined\" ? Library : undefined",
+        "typeof LibraryController !== \"undefined\" ? LibraryController : undefined");
+    const QByteArray legacyAliasHelperQml = buildHelperQml(
+        "import com.remarkable 1.0 as RM",
+        "typeof RM.Library !== \"undefined\" ? RM.Library : undefined",
+        "typeof RM.LibraryController !== \"undefined\" ? RM.LibraryController : undefined");
 
-    QQmlComponent component(g_engine);
-    component.setData(kHelperQml, QUrl());
-    QObject *holder = component.create(g_engine->rootContext());
-    if (!holder) {
-        const auto errors = component.errors();
-        for (const QQmlError &error : errors)
-            qWarning() << "[librarian]: QML helper error:" << error;
-        return false;
-    }
-    holder->setParent(g_engine);
+    QVariant libValue;
+    QVariant ctrlValue;
+    QObject *holder = nullptr;
+    QObject *lib = createHelperAndResolve(
+        g_engine,
+        "direct-helper",
+        directHelperQml.constData(),
+        &holder,
+        &libValue,
+        &ctrlValue);
 
-    QVariant v = holder->property("lib");
-    QObject *lib = v.isValid() ? v.value<QObject *>() : nullptr;
     if (!lib) {
-        qWarning() << "[librarian]: Library not found";
+        qWarning() << "[librarian]: direct helper did not resolve Library; trying legacy aliased helper";
+        QObject *legacyHolder = nullptr;
+        QVariant legacyLibValue;
+        QVariant legacyCtrlValue;
+        lib = createHelperAndResolve(
+            g_engine,
+            "legacy-helper",
+            legacyAliasHelperQml.constData(),
+            &legacyHolder,
+            &legacyLibValue,
+            &legacyCtrlValue);
+        if (lib) {
+            holder = legacyHolder;
+            libValue = legacyLibValue;
+            ctrlValue = legacyCtrlValue;
+        }
+    }
+
+    if (!lib) {
+        qWarning() << "[librarian]: Library not found after all helper strategies; engine =" << g_engine
+                   << "rootContext =" << g_engine->rootContext();
         return false;
     }
-    g_library = lib;
-    qInfo() << "[librarian]: Library resolved";
 
-    QVariant cv = holder->property("ctrl");
-    QObject *ctrl = cv.isValid() ? cv.value<QObject *>() : nullptr;
+    g_library = lib;
+    g_bridge = holder;
+    qInfo() << "[librarian]: Library resolved:" << describeObject(g_library)
+            << "via helper object" << describeObject(holder);
+
+    QObject *ctrl = ctrlValue.isValid() ? ctrlValue.value<QObject *>() : nullptr;
     if (ctrl) {
         g_libraryController = ctrl;
-        qInfo() << "[librarian]: LibraryController resolved";
+        qInfo() << "[librarian]: LibraryController resolved:" << describeObject(g_libraryController);
     } else {
         qWarning() << "[librarian]: LibraryController not found";
+    }
+
+    QVariant importerValue = holder ? holder->property("importer") : QVariant();
+    g_documentImporter = importerValue.isValid() ? importerValue.value<QObject *>() : nullptr;
+    qInfo() << "[librarian]: DocumentImporter property:" << describeVariant(importerValue)
+            << describeObject(g_documentImporter);
+
+    if (shouldLogAllMethods()) {
+        logObjectMethods("Library", g_library);
+        logObjectMethods("LibraryController", g_libraryController);
+        logObjectMethods("DocumentImporter", g_documentImporter);
     }
 
     return true;
@@ -108,10 +461,12 @@ static bool resolveLibrary()
 static void ensureInitialization()
 {
     if (!ensureEngine()) {
+        qInfo() << "[librarian]: initialization retry scheduled after missing engine";
         QTimer::singleShot(200, []() { ensureInitialization(); });
         return;
     }
     if (!resolveLibrary()) {
+        qInfo() << "[librarian]: initialization retry scheduled after unresolved library";
         QTimer::singleShot(200, []() { ensureInitialization(); });
     }
 }
@@ -144,44 +499,152 @@ static QString detectFileType(const QString &suffix)
 
 static void notifyLibrary(const QString &uuid)
 {
-    if (!g_library)
+    if (!g_bridge || !g_engine)
         return;
-
-    const QMetaObject *mo = g_library->metaObject();
-
-    int loadIdx = mo->indexOfSignal("requestLoadEntry(QString)");
-    if (loadIdx >= 0)
-        mo->method(loadIdx).invoke(g_library, Qt::QueuedConnection, Q_ARG(QString, uuid));
-
-    int addIdx = mo->indexOfSignal("entryAdded(QString)");
-    if (addIdx >= 0)
-        mo->method(addIdx).invoke(g_library, Qt::QueuedConnection, Q_ARG(QString, uuid));
+    runOnEngineSync([&]() {
+        invokeBridge1("pokeLibraryEntry", uuid);
+    });
 }
 
-static QString createFolderOnDisk(const QString &name, const QString &parentId)
+static bool waitForLibraryEntry(const QString &uuid, int timeoutMs = 5000)
 {
-    QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
-    QString timestamp = QString::number(QDateTime::currentMSecsSinceEpoch());
-    QString dir = xochitlDir();
+    if (!g_library || !g_bridge || !g_engine)
+        return false;
 
-    QJsonObject metadata;
-    metadata["createdTime"] = timestamp;
-    metadata["lastModified"] = timestamp;
-    metadata["parent"] = parentId;
-    metadata["pinned"] = false;
-    metadata["type"] = "CollectionType";
-    metadata["visibleName"] = name;
+    QElapsedTimer timer;
+    timer.start();
 
-    QFile file(QString("%1/%2.metadata").arg(dir, uuid));
-    if (!file.open(QIODevice::WriteOnly))
-        return QString();
-    file.write(QJsonDocument(metadata).toJson(QJsonDocument::Indented));
-    file.close();
+    while (timer.elapsed() < timeoutMs) {
+        notifyLibrary(uuid);
 
-    notifyLibrary(uuid);
-    return uuid;
+        bool present = false;
+        if (runOnEngineSync([&]() {
+                present = libraryHasEntry(uuid);
+            }) && present) {
+            qInfo() << "[librarian]: runtime library now recognizes" << uuid;
+            return true;
+        }
+
+        QThread::msleep(100);
+    }
+
+    qWarning() << "[librarian]: timed out waiting for runtime library entry" << uuid;
+    return false;
 }
 
+static bool startImporterImport(const QString &filePath, const QString &parentId, QString *outImportKey)
+{
+    if (!g_bridge || !g_engine)
+        return false;
+
+    QString importKey;
+    if (!runOnEngineSync([&]() {
+            QVariant keyValue;
+            invokeBridge2("importFromFile", filePath, parentId, &keyValue);
+            importKey = keyValue.toString();
+        }))
+        return false;
+
+    if (outImportKey)
+        *outImportKey = importKey;
+    return !importKey.isEmpty();
+}
+
+static bool waitForImporterResult(
+    const QString &filePath,
+    QString *outId,
+    QString *outError,
+    int timeoutMs = 30000)
+{
+    if (!g_bridge || !g_engine) {
+        if (outError)
+            *outError = "import bridge not initialized";
+        return false;
+    }
+
+    QElapsedTimer timer;
+    timer.start();
+
+    while (timer.elapsed() < timeoutMs) {
+        QString payload;
+        bool invokeOk = runOnEngineSync([&]() {
+            QVariant statusValue;
+            if (invokeBridge1("importStatus", filePath, &statusValue))
+                payload = statusValue.toString();
+        });
+
+        if (invokeOk && !payload.isEmpty()) {
+            const QJsonObject obj = QJsonDocument::fromJson(payload.toUtf8()).object();
+            const QString status = obj.value("status").toString();
+            const QString id = obj.value("id").toString();
+            const bool finished = obj.value("finished").toBool(false);
+
+            if (status == "imported" && !id.isEmpty()) {
+                if (outId)
+                    *outId = id;
+                return true;
+            }
+
+            if (status == "failed" || status == "missing-importer") {
+                if (outError)
+                    *outError = status.isEmpty() ? "import failed" : status;
+                return false;
+            }
+
+            if (finished && !id.isEmpty()) {
+                if (outId)
+                    *outId = id;
+                return true;
+            }
+        }
+
+        QThread::msleep(100);
+    }
+
+    if (outError)
+        *outError = "timed out waiting for importer";
+    return false;
+}
+
+static bool postProcessImportedEntry(
+    const QString &entryId,
+    const QString &parentId,
+    const QString &visibleName,
+    QString *outError = nullptr)
+{
+    if (!g_bridge || !g_engine) {
+        if (outError)
+            *outError = "extension not initialized";
+        return false;
+    }
+
+    bool ok = true;
+    if (!visibleName.isEmpty()) {
+        bool renameOk = false;
+        if (!runOnEngineSync([&]() {
+                QVariant okValue;
+                renameOk = invokeBridge2("setVisibleName", entryId, visibleName, &okValue) && okValue.toBool();
+            }) || !renameOk) {
+            if (outError)
+                *outError = "failed to rename imported entry";
+            ok = false;
+        }
+    }
+
+    if (ok && !parentId.isEmpty()) {
+        bool moveOk = false;
+        if (!runOnEngineSync([&]() {
+                QVariant okValue;
+                moveOk = invokeBridge2("moveEntry", entryId, parentId, &okValue) && okValue.toBool();
+            }) || !moveOk) {
+            if (outError)
+                *outError = "failed to move imported entry";
+            ok = false;
+        }
+    }
+
+    return ok;
+}
 
 static const QRegularExpression kUuidRe(
     "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
@@ -214,6 +677,17 @@ static QList<MetaEntry> loadMetadataIndex()
         entries.append(e);
     }
     return entries;
+}
+
+static QSet<QString> uuidsForParent(const QString &parentId)
+{
+    QSet<QString> uuids;
+    const QList<MetaEntry> entries = loadMetadataIndex();
+    for (const MetaEntry &e : entries) {
+        if (e.parent == parentId)
+            uuids.insert(e.uuid);
+    }
+    return uuids;
 }
 
 static QString resolveId(const QString &input)
@@ -326,7 +800,8 @@ extern "C" char *rescanLibrary(const char *params)
     (void)params;
     if (!g_library)
         return error("library not resolved");
-    if (!g_library->property("isReady").toBool())
+    QVariant readyValue;
+    if (!invokeBridge0("libraryIsReady", &readyValue) || !readyValue.toBool())
         return error("library not ready");
 
     QList<MetaEntry> entries = loadMetadataIndex();
@@ -334,10 +809,8 @@ extern "C" char *rescanLibrary(const char *params)
 
     QMetaObject::invokeMethod(g_engine, [&entries, &loaded]() {
         for (const MetaEntry &e : entries) {
-            QString parentId;
-            bool ok = QMetaObject::invokeMethod(g_library, "parentIdForId",
-                Qt::DirectConnection, Q_RETURN_ARG(QString, parentId),
-                Q_ARG(QString, e.uuid));
+            QVariant parentId;
+            bool ok = invokeBridge1("parentIdForId", e.uuid, &parentId);
             if (ok && parentId.isNull()) {
                 notifyLibrary(e.uuid);
                 loaded++;
@@ -462,6 +935,8 @@ extern "C" char *importDocument(const char *params)
         }
 
         notifyLibrary(uuid);
+        if (!waitForLibraryEntry(uuid))
+            return error("runtime library did not load imported rmdoc: " + uuid);
 
         qInfo() << "[librarian]: imported rmdoc" << filePath << "uuid" << uuid;
         return result(uuid);
@@ -470,56 +945,23 @@ extern "C" char *importDocument(const char *params)
     QString fileType = detectFileType(srcInfo.suffix());
     if (fileType.isEmpty())
         return error("unsupported file type: " + srcInfo.suffix());
+    const QString visibleName = stripExtension(srcInfo.fileName());
+    QString importKey;
+    if (!startImporterImport(srcInfo.absoluteFilePath(), parent, &importKey))
+        return error("failed to dispatch importer");
 
-    QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
-    QString timestamp = QString::number(QDateTime::currentMSecsSinceEpoch());
-    QString visibleName = stripExtension(srcInfo.fileName());
+    QString importedId;
+    QString importError;
+    if (!waitForImporterResult(srcInfo.absoluteFilePath(), &importedId, &importError))
+        return error("document importer failed: " + importError);
+    if (!waitForLibraryEntry(importedId))
+        return error("runtime library did not load imported document: " + importedId);
+    if (!postProcessImportedEntry(importedId, parent, visibleName, &importError))
+        return error("document importer post-process failed: " + importError);
 
-    if (!QFile::copy(srcInfo.absoluteFilePath(), QString("%1/%2.%3").arg(dir, uuid, fileType)))
-        return error("failed to copy file");
-
-    QJsonObject metadata;
-    metadata["createdTime"] = timestamp;
-    metadata["lastModified"] = timestamp;
-    metadata["lastOpened"] = "0";
-    metadata["lastOpenedPage"] = 0;
-    metadata["parent"] = parent;
-    metadata["pinned"] = false;
-    metadata["type"] = "DocumentType";
-    metadata["visibleName"] = visibleName;
-
-    QFile metaFile(QString("%1/%2.metadata").arg(dir, uuid));
-    if (!metaFile.open(QIODevice::WriteOnly))
-        return nullptr;
-    metaFile.write(QJsonDocument(metadata).toJson(QJsonDocument::Indented));
-    metaFile.close();
-
-    QJsonObject content;
-    content["coverPageNumber"] = -1;
-    content["documentMetadata"] = QJsonObject();
-    content["extraMetadata"] = QJsonObject();
-    content["fileType"] = fileType;
-    content["fontName"] = QString();
-    content["formatVersion"] = 2;
-    content["lineHeight"] = -1;
-    content["margins"] = 125;
-    content["orientation"] = "portrait";
-    content["pageCount"] = 0;
-    content["pageTags"] = QJsonArray();
-    content["tags"] = QJsonArray();
-    content["textScale"] = 1;
-    content["transform"] = QJsonObject();
-
-    QFile contentFile(QString("%1/%2.content").arg(dir, uuid));
-    if (!contentFile.open(QIODevice::WriteOnly))
-        return nullptr;
-    contentFile.write(QJsonDocument(content).toJson(QJsonDocument::Indented));
-    contentFile.close();
-
-    notifyLibrary(uuid);
-
-    qInfo() << "[librarian]: imported" << filePath << "as" << visibleName << "uuid" << uuid;
-    return result(uuid);
+    qInfo() << "[librarian]: imported" << filePath << "via DocumentImporter key" << importKey
+            << "uuid" << importedId;
+    return result(importedId);
 }
 
 
@@ -546,12 +988,9 @@ extern "C" char *importImage(const char *params)
     if (image.isNull())
         return error("failed to load image: " + filePath);
 
-    QString uuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
-    QString timestamp = QString::number(QDateTime::currentMSecsSinceEpoch());
-    QString dir = xochitlDir();
     QString visibleName = stripExtension(QFileInfo(filePath).fileName());
-
-    QString pdfPath = QString("%1/%2.pdf").arg(dir, uuid);
+    QString tempUuid = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
+    QString pdfPath = QString("%1/%2-import.pdf").arg(QDir::tempPath(), tempUuid);
 
     QPdfWriter writer(pdfPath);
     writer.setPageSize(QPageSize(image.size(), QPageSize::Unit::Point));
@@ -566,52 +1005,30 @@ extern "C" char *importImage(const char *params)
     painter.drawImage(painter.viewport(), image);
     painter.end();
 
-    QJsonObject metadata;
-    metadata["createdTime"] = timestamp;
-    metadata["lastModified"] = timestamp;
-    metadata["lastOpened"] = "0";
-    metadata["lastOpenedPage"] = 0;
-    metadata["parent"] = parent;
-    metadata["pinned"] = false;
-    metadata["type"] = "DocumentType";
-    metadata["visibleName"] = visibleName;
+    QString importKey;
+    if (!startImporterImport(pdfPath, parent, &importKey)) {
+        QFile::remove(pdfPath);
+        return error("failed to dispatch importer");
+    }
 
-    QFile metaFile(QString("%1/%2.metadata").arg(dir, uuid));
-    if (!metaFile.open(QIODevice::WriteOnly))
-        return error("failed to write metadata");
-    metaFile.write(QJsonDocument(metadata).toJson(QJsonDocument::Indented));
-    metaFile.close();
+    QString importedId;
+    QString importError;
+    const bool imported = waitForImporterResult(pdfPath, &importedId, &importError);
+    QFile::remove(pdfPath);
+    if (!imported)
+        return error("image importer failed: " + importError);
+    if (!waitForLibraryEntry(importedId))
+        return error("runtime library did not load imported image: " + importedId);
+    if (!postProcessImportedEntry(importedId, parent, visibleName, &importError))
+        return error("image importer post-process failed: " + importError);
 
-    QJsonObject content;
-    content["coverPageNumber"] = 0;
-    content["documentMetadata"] = QJsonObject();
-    content["extraMetadata"] = QJsonObject();
-    content["fileType"] = "pdf";
-    content["fontName"] = QString();
-    content["formatVersion"] = 2;
-    content["lineHeight"] = -1;
-    content["margins"] = 125;
-    content["orientation"] = "portrait";
-    content["pageCount"] = 1;
-    content["pageTags"] = QJsonArray();
-    content["tags"] = QJsonArray();
-    content["textScale"] = 1;
-    content["transform"] = QJsonObject();
-
-    QFile contentFile(QString("%1/%2.content").arg(dir, uuid));
-    if (!contentFile.open(QIODevice::WriteOnly))
-        return error("failed to write content");
-    contentFile.write(QJsonDocument(content).toJson(QJsonDocument::Indented));
-    contentFile.close();
-
-    notifyLibrary(uuid);
-
-    qInfo() << "[librarian]: imported image" << filePath << "as" << visibleName << "uuid" << uuid;
-    return result(uuid);
+    qInfo() << "[librarian]: imported image" << filePath << "as" << visibleName
+            << "via DocumentImporter key" << importKey << "uuid" << importedId;
+    return result(importedId);
 }
 
 #define REQUIRE_CTRL() do { \
-    if (!g_libraryController || !g_engine) return error("extension not initialized"); \
+    if (!g_bridge || !g_engine) return error("extension not initialized"); \
 } while(0)
 
 static bool sceneHasInk(const QJsonObject &root)
@@ -725,13 +1142,15 @@ extern "C" char *renameEntry(const char *params)
     QString newName = input.mid(sep + 1);
     if (newName.isEmpty()) return error("new name is empty");
 
-    QMetaObject::invokeMethod(g_engine, [id, newName]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setVisibleName",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(QString, newName));
-        qInfo() << "[librarian]: rename" << id << "→" << newName << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge2("setVisibleName", id, newName, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: rename" << id << "→" << newName << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch rename");
+    if (!ok)
+        return error("rename failed");
     return strdup("ok");
 }
 
@@ -750,13 +1169,15 @@ extern "C" char *moveEntry(const char *params)
         parentId = p;
     }
 
-    QMetaObject::invokeMethod(g_engine, [id, parentId]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "moveEntry",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(QString, parentId));
-        qInfo() << "[librarian]: move" << id << "→" << parentId << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge2("moveEntry", id, parentId, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: move" << id << "→" << parentId << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch move");
+    if (!ok)
+        return error("move failed");
     return strdup("ok");
 }
 
@@ -765,13 +1186,20 @@ extern "C" char *trashEntry(const char *params)
     REQUIRE_CTRL();
     RESOLVE(id, resolveId(QString::fromUtf8(params ? params : "")));
 
-    QMetaObject::invokeMethod(g_engine, [id]() {
-        QStringList ids = { id };
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "moveEntriesToTrash",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok), Q_ARG(QStringList, ids));
-        qInfo() << "[librarian]: trash" << id << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    QString parentBeforeTrash;
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant parentValue;
+            if (invokeBridge1("parentIdForId", id, &parentValue))
+                parentBeforeTrash = parentValue.toString();
+            QVariant okValue;
+            ok = invokeBridge1("moveSingleEntryToTrash", id, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: trash" << id << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch trash");
+    if (!ok)
+        return error("trash failed");
+    g_preTrashParents.insert(id, parentBeforeTrash);
     return strdup("ok");
 }
 
@@ -780,28 +1208,41 @@ extern "C" char *restoreEntry(const char *params)
     REQUIRE_CTRL();
     RESOLVE(id, resolveIdInTrash(QString::fromUtf8(params ? params : "")));
 
-    QMetaObject::invokeMethod(g_engine, [id]() {
-        QStringList ids = { id };
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "restoreEntriesFromTrash",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok), Q_ARG(QStringList, ids));
-        qInfo() << "[librarian]: restore" << id << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    const QString restoreParentId = g_preTrashParents.value(id);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge1("restoreSingleEntryFromTrash", id, &okValue) && okValue.toBool();
+            if (ok && !restoreParentId.isEmpty()) {
+                QVariant moveOkValue;
+                const bool moveOk = invokeBridge2("moveEntry", id, restoreParentId, &moveOkValue) && moveOkValue.toBool();
+                if (!moveOk)
+                    qWarning() << "[librarian]: restore post-move failed for" << id << "→" << restoreParentId;
+                ok = ok && moveOk;
+            }
+            qInfo() << "[librarian]: restore" << id << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch restore");
+    if (!ok)
+        return error("restore failed");
+    g_preTrashParents.remove(id);
     return strdup("ok");
 }
 
 extern "C" char *deleteEntry(const char *params)
 {
     REQUIRE_CTRL();
-    RESOLVE(id, resolveId(QString::fromUtf8(params ? params : "")));
+    RESOLVE(id, resolveIdInTrash(QString::fromUtf8(params ? params : "")));
 
-    QMetaObject::invokeMethod(g_engine, [id]() {
-        QStringList ids = { id };
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "deleteEntries",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok), Q_ARG(QStringList, ids));
-        qInfo() << "[librarian]: delete" << id << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge1("deleteSingleEntry", id, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: delete" << id << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch delete");
+    if (!ok)
+        return error("delete failed");
     return strdup("ok");
 }
 
@@ -820,14 +1261,37 @@ extern "C" char *cloneEntry(const char *params)
         parentId = p;
     }
 
-    QMetaObject::invokeMethod(g_engine, [id, parentId]() {
-        QString newId;
-        QMetaObject::invokeMethod(g_libraryController, "cloneEntry",
-            Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-            Q_ARG(QString, id), Q_ARG(QString, parentId));
-        qInfo() << "[librarian]: clone" << id << "→" << newId;
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    const QString effectiveParentId = parentId;
+    const QSet<QString> before = uuidsForParent(effectiveParentId);
+    QString newId;
+    if (!runOnEngineSync([&]() {
+            QVariant newIdValue;
+            invokeBridge2("cloneEntry", id, parentId, &newIdValue);
+            newId = newIdValue.toString();
+            qInfo() << "[librarian]: clone" << id << "→" << newId;
+        }))
+        return error("failed to dispatch clone");
+
+    if (newId.isEmpty()) {
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < 5000) {
+            const QSet<QString> after = uuidsForParent(effectiveParentId);
+            for (const QString &candidate : after) {
+                if (!before.contains(candidate)) {
+                    newId = candidate;
+                    break;
+                }
+            }
+            if (!newId.isEmpty())
+                break;
+            QThread::msleep(100);
+        }
+    }
+
+    if (newId.isEmpty())
+        return error("clone failed");
+    return result(newId);
 }
 
 extern "C" char *createNotebook(const char *params)
@@ -848,14 +1312,17 @@ extern "C" char *createNotebook(const char *params)
     }
     if (name.isEmpty()) return error("name is empty");
 
-    QMetaObject::invokeMethod(g_engine, [name, parentId]() {
-        QString newId;
-        QMetaObject::invokeMethod(g_libraryController, "createDocument",
-            Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-            Q_ARG(QString, parentId), Q_ARG(QString, name));
-        qInfo() << "[librarian]: createNotebook" << name << "→" << newId;
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    QString newId;
+    if (!runOnEngineSync([&]() {
+            QVariant newIdValue;
+            invokeBridge2("createDocument", parentId, name, &newIdValue);
+            newId = newIdValue.toString();
+            qInfo() << "[librarian]: createNotebook" << name << "→" << newId;
+        }))
+        return error("failed to dispatch createNotebook");
+    if (newId.isEmpty())
+        return error("createNotebook failed");
+    return result(newId);
 }
 
 extern "C" char *setPinned(const char *params)
@@ -868,13 +1335,15 @@ extern "C" char *setPinned(const char *params)
     RESOLVE(id, resolveId(input.left(sep)));
     bool pinned = input.mid(sep + 1).trimmed().compare("true", Qt::CaseInsensitive) == 0;
 
-    QMetaObject::invokeMethod(g_engine, [id, pinned]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setPinned",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(bool, pinned));
-        qInfo() << "[librarian]: setPinned" << id << pinned << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge2("setPinned", id, pinned, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: setPinned" << id << pinned << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch setPinned");
+    if (!ok)
+        return error("setPinned failed");
     return strdup("ok");
 }
 
@@ -888,13 +1357,15 @@ extern "C" char *setCover(const char *params)
     RESOLVE(id, resolveId(input.left(sep)));
     int page = input.mid(sep + 1).trimmed().toInt();
 
-    QMetaObject::invokeMethod(g_engine, [id, page]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setCoverPageNumber",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(int, page));
-        qInfo() << "[librarian]: setCover" << id << page << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge2("setCoverPageNumber", id, page, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: setCover" << id << page << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch setCover");
+    if (!ok)
+        return error("setCover failed");
     return strdup("ok");
 }
 
@@ -909,13 +1380,15 @@ extern "C" char *setOrientation(const char *params)
     QString val = input.mid(sep + 1).trimmed().toLower();
     int orientation = (val == "landscape" || val == "horizontal") ? Qt::Horizontal : Qt::Vertical;
 
-    QMetaObject::invokeMethod(g_engine, [id, orientation]() {
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setOrientation",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(Qt::Orientation, static_cast<Qt::Orientation>(orientation)));
-        qInfo() << "[librarian]: setOrientation" << id << orientation << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QVariant okValue;
+            ok = invokeBridge2("setOrientation", id, orientation, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: setOrientation" << id << orientation << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch setOrientation");
+    if (!ok)
+        return error("setOrientation failed");
     return strdup("ok");
 }
 
@@ -929,14 +1402,16 @@ extern "C" char *setTags(const char *params)
     RESOLVE(id, resolveId(input.left(sep)));
     QStringList tags = input.mid(sep + 1).split(';', Qt::SkipEmptyParts);
 
-    QMetaObject::invokeMethod(g_engine, [id, tags]() {
-        QStringList partial;
-        bool ok = false;
-        QMetaObject::invokeMethod(g_libraryController, "setEntryTags",
-            Qt::DirectConnection, Q_RETURN_ARG(bool, ok),
-            Q_ARG(QString, id), Q_ARG(QStringList, tags), Q_ARG(QStringList, partial));
-        qInfo() << "[librarian]: setTags" << id << tags << (ok ? "ok" : "FAILED");
-    }, Qt::QueuedConnection);
+    bool ok = false;
+    if (!runOnEngineSync([&]() {
+            QStringList partial;
+            QVariant okValue;
+            ok = invokeBridge3("setEntryTags", id, tags, partial, &okValue) && okValue.toBool();
+            qInfo() << "[librarian]: setTags" << id << tags << (ok ? "ok" : "FAILED");
+        }))
+        return error("failed to dispatch setTags");
+    if (!ok)
+        return error("setTags failed");
     return strdup("ok");
 }
 
@@ -958,22 +1433,22 @@ extern "C" char *createFolder(const char *params)
     }
     if (name.isEmpty()) return error("name is empty");
 
-    QMetaObject::invokeMethod(g_engine, [name, parentId]() {
-        QString newId;
-        QMetaObject::invokeMethod(g_libraryController, "createCollectionWrapper",
-            Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-            Q_ARG(QString, parentId), Q_ARG(QString, name));
-        if (newId.isEmpty())
-            QMetaObject::invokeMethod(g_library, "createCollectionWrapper",
-                Qt::DirectConnection, Q_RETURN_ARG(QString, newId),
-                Q_ARG(QString, parentId), Q_ARG(QString, name));
-        qInfo() << "[librarian]: createFolder" << name << "→" << newId;
-    }, Qt::QueuedConnection);
-    return strdup("ok");
+    QString newId;
+    if (!runOnEngineSync([&]() {
+            QVariant newIdValue;
+            invokeBridge2("createFolder", parentId, name, &newIdValue);
+            newId = newIdValue.toString();
+            qInfo() << "[librarian]: createFolder" << name << "→" << newId;
+        }))
+        return error("failed to dispatch createFolder");
+    if (newId.isEmpty())
+        return error("createFolder failed");
+    return result(newId);
 }
 
 extern "C" char *ensureFolder(const char *params)
 {
+    REQUIRE_CTRL();
     if (!params || params[0] == '\0')
         return error("empty input");
 
@@ -997,7 +1472,14 @@ extern "C" char *ensureFolder(const char *params)
         }
 
         if (found.isEmpty()) {
-            found = createFolderOnDisk(name, parentId);
+            QString newId;
+            if (!runOnEngineSync([&]() {
+                    QVariant newIdValue;
+                    invokeBridge2("createFolder", parentId, name, &newIdValue);
+                    newId = newIdValue.toString();
+                }))
+                return error("failed to dispatch folder creation: " + name);
+            found = newId;
             if (found.isEmpty())
                 return error("failed to create folder: " + name);
 
