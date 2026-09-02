@@ -75,7 +75,20 @@ jobs:
       - name: Generate changelog
         run: |
           git cliff --config-url https://gist.githubusercontent.com/rmitchellscott/823c46de7a1c3e6d57e9de90ee00d84a/raw/cliff.toml \
-            --latest --strip header | tail -n +2 > CHANGELOG.md
+            --latest --strip header | tail -n +2 > RELEASE_NOTES.md
+          git cliff --config-url https://gist.githubusercontent.com/rmitchellscott/823c46de7a1c3e6d57e9de90ee00d84a/raw/cliff.toml > CHANGELOG.md
+
+      - name: Commit changelog
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if git diff --staged --quiet; then
+            echo "No changelog changes to commit"
+          else
+            git commit -m "chore: update changelog for ${{ github.ref_name }} [skip ci]"
+            git push origin HEAD:main
+          fi
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -87,4 +100,4 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: librarian-*.so
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
