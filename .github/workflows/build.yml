@@ -86,7 +86,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changelog changes to commit"
           else
-            git commit -m "chore: update changelog for ${{ github.ref_name }} [skip ci]"
+            git commit -m "chore(release): update changelog for ${{ github.ref_name }} [skip ci]"
             git push origin HEAD:main
           fi
 
