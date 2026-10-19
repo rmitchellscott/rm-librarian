@@ -71,6 +71,8 @@ static bool resolveLibrary()
         QtObject {
             property var lib: Library
             property var ctrl: LibraryController
+            // Library is a LibraryFacade without requestLoadEntry; the backend is DocumentController.library.
+            property var loader: DocumentController.library
             function callCtrl(m, a) { return LibraryController[m].apply(LibraryController, a); }
             function callLib(m, a) { return Library[m].apply(Library, a); }
             function idList(uuids) {
@@ -84,7 +86,8 @@ static bool resolveLibrary()
             function callList(m, uuids, rest) {
                 return LibraryController[m].apply(LibraryController, [idList(uuids)].concat(rest));
             }
-            function notify(id) { Library.requestLoadEntry(id); Library.entryAdded(id); }
+            function hasEntry(uuid) { return !!Library.entryForId(uuid); }
+            function notify(id) { loader.requestLoadEntry(id); }
         }
     )QML";
 
@@ -108,6 +111,13 @@ static bool resolveLibrary()
     g_invoker = holder;
     g_library = lib;
     qInfo() << "[librarian]: Library resolved";
+
+    QVariant lv = holder->property("loader");
+    QObject *loader = lv.isValid() ? lv.value<QObject *>() : nullptr;
+    if (loader)
+        qInfo() << "[librarian]: entry loader resolved:" << loader->metaObject()->className();
+    else
+        qWarning() << "[librarian]: entry loader not found";
 
     QVariant cv = holder->property("ctrl");
     QObject *ctrl = cv.isValid() ? cv.value<QObject *>() : nullptr;
@@ -386,8 +396,11 @@ extern "C" char *rescanLibrary(const char *params)
 
     QMetaObject::invokeMethod(g_engine, [&entries, &loaded]() {
         for (const MetaEntry &e : entries) {
-            QString parentId = variantToId(libCall("parentIdForId", { e.uuid }));
-            if (parentId.isEmpty()) {
+            QVariant known;
+            QMetaObject::invokeMethod(g_invoker, "hasEntry", Qt::DirectConnection,
+                Q_RETURN_ARG(QVariant, known),
+                Q_ARG(QVariant, QVariant(e.uuid)));
+            if (!known.toBool()) {
                 notifyLibrary(e.uuid);
                 loaded++;
             }
