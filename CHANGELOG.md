@@ -1,3 +1,14 @@
+## [0.4.2] - 2026-10-26
+
+### 🔧 Fixes & Tweaks
+
+- Support for remarkable os 3.29 (#3)
+
+### 💼 Others
+
+- Update changelog for v0.4.1
+
+
 ## [0.4.1] - 2026-09-02
 
 ### 🔧 Fixes & Tweaks
