@@ -1,3 +1,10 @@
+## [0.4.3] - 2026-11-11
+
+### 🔧 Fixes & Tweaks
+
+- Load only in xochitl (#4)
+
+
 ## [0.4.2] - 2026-10-26
 
 ### 🔧 Fixes & Tweaks
