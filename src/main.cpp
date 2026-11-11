@@ -1056,8 +1056,3 @@ extern "C" void _xovi_construct()
     qInfo() << "[librarian]: extension loaded";
     QTimer::singleShot(0, []() { ensureInitialization(); });
 }
-
-extern "C" char _xovi_shouldLoad()
-{
-    return 1;
-}

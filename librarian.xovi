@@ -1,4 +1,6 @@
-version 0.4.0
+version 0.4.3
+
+condition _ZNK3csl10devicelock10DeviceLock3setENS1_5StateE
 
 export rescanLibrary
 with
